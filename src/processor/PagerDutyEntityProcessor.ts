@@ -1,5 +1,5 @@
 import { DiscoveryService, LoggerService } from "@backstage/backend-plugin-api";
-import { Entity, RELATION_DEPENDS_ON, RELATION_DEPENDENCY_OF } from "@backstage/catalog-model";
+import { Entity, RELATION_DEPENDS_ON, RELATION_DEPENDENCY_OF, stringifyEntityRef, getCompoundEntityRef } from "@backstage/catalog-model";
 import { CatalogProcessor, CatalogProcessorEmit, processingResult } from "@backstage/plugin-catalog-node";
 import { LocationSpec } from "@backstage/plugin-catalog-common";
 import { PagerDutyClient } from "../apis/client";
@@ -56,14 +56,22 @@ export class PagerDutyEntityProcessor implements CatalogProcessor {
             try {
                 // Process service mapping overrides
                 // Find the service mapping for the entity in database
-                const mapping = await client.findServiceMapping({
-                    type: entity.kind.toLowerCase(),
-                    namespace: entity.metadata.namespace!.toLowerCase(),
-                    name: entity.metadata.name.toLowerCase(),
-                });
+                let { kind: type, namespace, name } = getCompoundEntityRef(entity);
+                type = type.toLocaleLowerCase('en-US');
+                namespace = namespace.toLocaleLowerCase('en-US');
+                name = name.toLocaleLowerCase('en-US');
+
+                // Add the mapping to the database based on entity annotations
+                let serviceId = entity.metadata.annotations?.["pagerduty.com/service-id"];
+                let integrationKey = entity.metadata.annotations?.["pagerduty.com/integration-key"];
+                const account = entity.metadata.annotations?.["pagerduty.com/account"];
+                const mapping = await client.findServiceMapping({ type, namespace, name });
 
                 // If mapping exists add the annotations to the entity
-                if (mapping) {
+                if (serviceId && integrationKey) {
+                    this.logger.debug(`Service ID and integration key annotations already set, skipping mapping lookup.`);
+                    return entity;
+                } else if (mapping && (mapping.serviceId === serviceId || serviceId === undefined)) {
                     updateAnnotations(entity,
                         {
                             serviceId: mapping.serviceId,
@@ -74,93 +82,66 @@ export class PagerDutyEntityProcessor implements CatalogProcessor {
 
                     this.logger.debug(`Added annotations to entity ${entity.metadata.name} with service id: ${mapping.serviceId}, integration key: ${mapping.integrationKey} and account: ${mapping.account}`);
                 } else {
-                    this.logger.debug(`No mapping found for entity: ${entity.metadata.name}. Adding annotations to the database.`);
-
-                    // Add the mapping to the database based on entity annotations
-                    let serviceId = entity.metadata.annotations?.["pagerduty.com/service-id"];
-                    let integrationKey = entity.metadata.annotations?.["pagerduty.com/integration-key"];
-                    const account = entity.metadata.annotations?.["pagerduty.com/account"];
+                    this.logger.debug(`No mapping or outdated mapping found for entity: ${entity.metadata.name}. Adding annotations to the database.`);
 
                     // Build the entityRef string
-                    const entityRef = `${entity.kind.toLowerCase()}:${entity.metadata.namespace?.toLowerCase()}/${entity.metadata.name.toLowerCase()}`;
+                    const entityRef = stringifyEntityRef(entity);
 
                     if (serviceId) {
-                        // Check for mapping override by user
-                        const serviceMappingOverrideFound = await client.findServiceMappingById(serviceId);
+                        // if integrationKey annotation does not exist
+                        // try to retrieve it from PagerDuty
+                        if (!integrationKey) {
+                            const foundIntegrationKey = await client.getIntegrationKeyFromServiceId(serviceId, account);
 
-                        // If service mapping override is not found
-                        // insert the mapping into the database
-                        if (!serviceMappingOverrideFound) {
-                            // if integrationKey annotation does not exist
-                            // try to retrieve it from PagerDuty
-                            if (!integrationKey) {
-                                const foundIntegrationKey = await client.getIntegrationKeyFromServiceId(serviceId, account);
-
-                                if (foundIntegrationKey) {
-                                    integrationKey = foundIntegrationKey;
-                                }
+                            if (foundIntegrationKey) {
+                                integrationKey = foundIntegrationKey;
                             }
+                        }
 
-                            // Insert the mapping into the database
-                            this.logger.debug(`Inserting mapping for entity: ${entityRef} with service id: ${serviceId}, integration key: ${integrationKey} and account: ${account}`);
-                            await client.insertServiceMapping({
-                                entityRef,
+                        // Insert the mapping into the database
+                        this.logger.debug(`Integration key lookup: Inserting mapping for entity: ${entityRef} with service id: ${serviceId}, integration key: ${integrationKey} and account: ${account}`);
+                        await client.insertServiceMapping({
+                            entityRef,
+                            serviceId,
+                            integrationKey,
+                            account,
+                        });
+
+                        // Add the annotations to the entity
+                        updateAnnotations(entity,
+                            {
                                 serviceId,
                                 integrationKey,
-                                account,
-                            });
-
-                            // Add the annotations to the entity
-                            updateAnnotations(entity,
-                                {
-                                    serviceId,
-                                    integrationKey,
-                                    account
-                                }
-                            );
-                        }
-                        else {
-                            this.logger.debug(`Service mapping override found for service id: ${serviceId}.`);
-                            updateAnnotations(entity, {}); // delete annotations because user unmapped the service
-                        }
+                                account
+                            }
+                        );
                     }
                     else if (integrationKey) {
                         serviceId = await client.getServiceIdFromIntegrationKey(integrationKey, account);
 
-                        // Check for mapping override by user
-                        const serviceMappingOverrideFound = await client.findServiceMappingById(serviceId);
+                        // Insert the mapping into the database
+                        this.logger.debug(`Service ID lookup: inserting mapping for entity: ${entityRef} with new service id: ${serviceId}, integration key: ${integrationKey} and account: ${account}`);
+                        await client.insertServiceMapping({
+                            entityRef,
+                            serviceId,
+                            integrationKey,
+                            account,
+                        });
 
-                        // If service mapping override is not found
-                        // insert the mapping into the database
-                        if (!serviceMappingOverrideFound) {
-                            // Insert the mapping into the database
-                            this.logger.debug(`Inserting mapping for entity: ${entityRef} with new service id: ${serviceId}, integration key: ${integrationKey} and account: ${account}`);
-                            await client.insertServiceMapping({
-                                entityRef,
+                        updateAnnotations(entity,
+                            {
                                 serviceId,
                                 integrationKey,
-                                account,
-                            });
-
-                            updateAnnotations(entity,
-                                {
-                                    serviceId,
-                                    integrationKey,
-                                    account
-                                }
-                            );
-                        }
-                        else {
-                            this.logger.debug(`Service mapping override found for service id: ${serviceId}. Skipping adding to the database.`);
-                            updateAnnotations(entity, {}); // delete annotations because user unmapped the service
-                        }
+                                account
+                            }
+                        );
                     }
                 }
 
                 // Process service dependencies
                 // if (entity.spec?.dependsOn) {
                 // Check if ServiceId exists get service dependencies from PagerDuty 
-                const serviceId = entity.metadata.annotations?.["pagerduty.com/service-id"];
+                serviceId = entity.metadata.annotations?.["pagerduty.com/service-id"];
 
                 if (serviceId) {
                     const strategySetting = await client.getServiceDependencyStrategySetting();
@@ -178,7 +159,6 @@ export class PagerDutyEntityProcessor implements CatalogProcessor {
                         const entityDependencies: string[] = await buildExistingDependencies(dependencyAnnotations);
 
                         // Get dependencies from PagerDuty for the service
-                        const account = entity.metadata.annotations?.["pagerduty.com/account"];
                         const dependencies = await client.getServiceDependencies(serviceId, account);
                         const filteredDependencies = dependencies.filter(x => x.dependent_service.id === serviceId);
                         const dependencyIds = filteredDependencies.map(x => x.supporting_service.id);

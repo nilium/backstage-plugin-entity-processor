@@ -1,5 +1,5 @@
 import { DiscoveryService, LoggerService } from "@backstage/backend-plugin-api";
-import { Entity, RELATION_DEPENDS_ON, RELATION_DEPENDENCY_OF } from "@backstage/catalog-model";
+import { Entity, RELATION_DEPENDS_ON, RELATION_DEPENDENCY_OF, stringifyEntityRef, getCompoundEntityRef } from "@backstage/catalog-model";
 import { CatalogProcessor, CatalogProcessorEmit, processingResult } from "@backstage/plugin-catalog-node";
 import { LocationSpec } from "@backstage/plugin-catalog-common";
 import { PagerDutyClient } from "../apis/client";
@@ -56,11 +56,12 @@ export class PagerDutyEntityProcessor implements CatalogProcessor {
             try {
                 // Process service mapping overrides
                 // Find the service mapping for the entity in database
-                const mapping = await client.findServiceMapping({
-                    type: entity.kind.toLowerCase(),
-                    namespace: entity.metadata.namespace!.toLowerCase(),
-                    name: entity.metadata.name.toLowerCase(),
-                });
+                let { kind: type, namespace, name } = getCompoundEntityRef(entity);
+                type = type.toLocaleLowerCase('en-US');
+                namespace = namespace.toLocaleLowerCase('en-US');
+                name = name.toLocaleLowerCase('en-US');
+
+                const mapping = await client.findServiceMapping({ type, namespace, name });
 
                 // If mapping exists add the annotations to the entity
                 if (mapping) {
@@ -82,7 +83,7 @@ export class PagerDutyEntityProcessor implements CatalogProcessor {
                     const account = entity.metadata.annotations?.["pagerduty.com/account"];
 
                     // Build the entityRef string
-                    const entityRef = `${entity.kind.toLowerCase()}:${entity.metadata.namespace?.toLowerCase()}/${entity.metadata.name.toLowerCase()}`;
+                    const entityRef = stringifyEntityRef(entity);
 
                     if (serviceId) {
                         // Check for mapping override by user
